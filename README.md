@@ -41,6 +41,9 @@ One-command tool to download a YouTube video, generate a transcript, and produce
 | `-o, --output-dir DIR` | Base directory for all output | `.` (current dir) |
 | `-p, --llm-provider PROVIDER` | LLM backend: `ollama`, `llm`, `anthropic`, `openai` | auto-detected |
 | `-l, --llm-model MODEL` | Model name for the chosen provider | provider-specific |
+| `-a, --audio-only` | Download audio only (m4a) — no video | off |
+| `-t, --transcript-only` | Get transcript only — no media download | off |
+| `-n, --no-summary` | Skip the LLM summarization step | off |
 | `-k, --keep-scratch` | Preserve the `.scratch/` working directory | off |
 | `-h, --help` | Print usage and exit | — |
 | `-v, --version` | Print version and exit | — |
@@ -122,23 +125,37 @@ The `.scratch/` directory is automatically deleted after a successful run unless
 
 The script checks for existing output files at each step and skips work that's already done. If a run fails partway through (e.g., network error during LLM call), just re-run the same command — it picks up where it left off.
 
+## Selective Output Modes
+
+### `--audio-only` (`-a`)
+Downloads only the audio track as `audio.m4a` instead of the full video. Useful for podcasts, interviews, or saving disk space. The transcript and summary steps work the same — Whisper can transcribe directly from the audio file.
+
+### `--transcript-only` (`-t`)
+Skips all media downloads and only produces `transcript.txt`. Uses YouTube subtitles (or subtitle-only fetch). Implies `--no-summary`. Ideal for quickly grabbing what was said without storing any media.
+
+### `--no-summary` (`-n`)
+Skips the LLM summarization step. Produces the media file and transcript but no `summary.md`. Useful when you don't have an LLM provider configured or just want the raw transcript.
+
 ## Examples
 
 ```sh
 # Basic — auto-detect everything
 ./get-yt "https://www.youtube.com/watch?v=VckmK-ZCpAU"
 
+# Audio only — no video file
+./get-yt --audio-only "$URL"
+
+# Just the transcript — no media, no summary
+./get-yt --transcript-only "$URL"
+
+# Download + transcript, skip the LLM summary
+./get-yt --no-summary -o ~/archive "$URL"
+
 # Use Whisper for higher-quality transcript
 ./get-yt --method whisper "$URL"
 
-# Organize into a dedicated archive folder
-./get-yt -o ~/video-archive "$URL"
-
 # Use Anthropic API with a specific model
 ./get-yt -p anthropic -l claude-sonnet-4-20250514 "$URL"
-
-# Keep scratch files for debugging
-./get-yt --keep-scratch "$URL"
 
 # Batch process a list of URLs
 while IFS= read -r url; do
