@@ -1,0 +1,466 @@
+#!/usr/bin/env bash
+#
+# get-yt — Download, transcribe, and summarize YouTube videos.
+# Creates a per-video directory with: video.mp4, transcript.txt, summary.md
+#
+set -euo pipefail
+
+VERSION="1.0.0"
+
+# ── Defaults ──────────────────────────────────────────────────────────────────
+METHOD="auto"
+WHISPER_MODEL="mlx-community/whisper-large-v3-turbo"
+OUTPUT_DIR="."
+LLM_PROVIDER=""
+LLM_MODEL=""
+KEEP_SCRATCH=false
+URL=""
+
+# ── Colors ────────────────────────────────────────────────────────────────────
+BLUE='\033[0;34m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'; NC='\033[0m'
+
+log()  { printf "${BLUE}[·]${NC} %s\n" "$*"; }
+ok()   { printf "${GREEN}[✓]${NC} %s\n" "$*"; }
+warn() { printf "${YELLOW}[!]${NC} %s\n" "$*"; }
+err()  { printf "${RED}[✗]${NC} %s\n" "$*" >&2; }
+
+# ── Usage ─────────────────────────────────────────────────────────────────────
+usage() {
+  cat << 'EOF'
+Usage: get-yt [OPTIONS] [URL]
+
+Download a YouTube video, generate a transcript, and create an LLM-powered
+summary. Each video gets its own directory containing:
+
+  video.mp4        — the downloaded video
+  transcript.txt   — plain-text transcript
+  summary.md       — LLM-generated markdown summary
+
+Options:
+  -u, --url URL                YouTube video URL (prompted if omitted)
+  -m, --method METHOD          Transcript method (default: auto)
+                                 auto    — try YouTube subs, fall back to Whisper
+                                 youtube — YouTube subtitles only
+                                 whisper — local Whisper transcription only
+  -w, --whisper-model MODEL    Whisper model (default: mlx-community/whisper-large-v3-turbo)
+  -o, --output-dir DIR         Base output directory (default: current directory)
+  -p, --llm-provider PROVIDER  LLM backend (auto-detected if omitted)
+                                 ollama, llm, anthropic, openai
+  -l, --llm-model MODEL        LLM model name (provider-specific default)
+  -k, --keep-scratch           Keep temporary working files
+  -h, --help                   Show this help message
+  -v, --version                Show version
+
+Dependencies:
+  Required : yt-dlp, ffmpeg, python3
+  Optional : mlx_whisper (for --method whisper on Apple Silicon)
+             llm CLI (for --llm-provider llm)
+             ollama (for --llm-provider ollama — default if running)
+
+Examples:
+  get-yt "https://www.youtube.com/watch?v=VckmK-ZCpAU"
+  get-yt --method whisper -o ~/archive "$URL"
+  get-yt -p anthropic -l claude-sonnet-4-20250514 "$URL"
+
+See README.md for full documentation.
+EOF
+}
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+sanitize() {
+  echo "$1" | sed 's/[^a-zA-Z0-9._-]/_/g; s/__*/_/g; s/^_//; s/_$//' | cut -c1-80
+}
+
+clean_vtt() {
+  python3 - "$1" << 'PYEOF'
+import re, sys
+
+with open(sys.argv[1], encoding="utf-8", errors="replace") as f:
+    text = f.read()
+
+# Strip WEBVTT header block
+text = re.sub(r"^WEBVTT.*?\n\n", "", text, flags=re.DOTALL)
+# Strip standalone cue identifiers (bare numbers on their own line)
+text = re.sub(r"^\d+\s*$", "", text, flags=re.MULTILINE)
+# Strip timestamp lines and positioning metadata
+text = re.sub(r"\d{2}:\d{2}[\d:.]+\s*-->.*", "", text)
+# Strip inline HTML / timing tags  (<c>, <00:01:23.456>, etc.)
+text = re.sub(r"<[^>]+>", "", text)
+# Decode common HTML entities
+for old, new in [("&amp;","&"),("&lt;","<"),("&gt;",">"),
+                 ("&#39;","'"),("&quot;",'"'),("&nbsp;"," ")]:
+    text = text.replace(old, new)
+# Deduplicate consecutive identical lines and emit
+seen = set()
+for line in text.strip().split("\n"):
+    line = line.strip()
+    if line and line not in seen:
+        print(line)
+        seen.add(line)
+PYEOF
+}
+
+# ── LLM integration ──────────────────────────────────────────────────────────
+
+detect_llm_provider() {
+  # Prefer ollama (local, no API key needed) → llm CLI → cloud APIs
+  if curl -sf http://localhost:11434/api/tags >/dev/null 2>&1; then
+    echo "ollama"
+  elif command -v llm &>/dev/null; then
+    echo "llm"
+  elif [[ -n "${ANTHROPIC_API_KEY:-}" ]]; then
+    echo "anthropic"
+  elif [[ -n "${OPENAI_API_KEY:-}" ]]; then
+    echo "openai"
+  else
+    echo ""
+  fi
+}
+
+default_llm_model() {
+  case "$1" in
+    ollama)
+      # Pick the first installed model
+      curl -sf http://localhost:11434/api/tags 2>/dev/null | \
+        python3 -c "
+import json, sys
+try:
+    data = json.loads(sys.stdin.read())
+    models = [m['name'] for m in data.get('models', [])]
+    print(models[0] if models else '')
+except: pass
+" 2>/dev/null || echo ""
+      ;;
+    llm)       echo "" ;;  # uses llm's configured default
+    anthropic) echo "claude-sonnet-4-20250514" ;;
+    openai)    echo "gpt-4o" ;;
+    *)         echo "" ;;
+  esac
+}
+
+call_llm_api() {
+  # Sends a prompt file to the specified LLM provider via REST API.
+  # Usage: call_llm_api <prompt_file> <provider> <model>
+  python3 - "$1" "$2" "$3" << 'PYEOF'
+import json, os, sys, urllib.request, urllib.error
+
+prompt_file, provider, model = sys.argv[1], sys.argv[2], sys.argv[3]
+
+with open(prompt_file, encoding="utf-8") as f:
+    content = f.read()
+
+if provider == "ollama":
+    url     = "http://localhost:11434/api/chat"
+    payload = {"model": model, "messages": [{"role":"user","content":content}], "stream": False}
+    headers = {"Content-Type": "application/json"}
+    extract = lambda d: d["message"]["content"]
+elif provider == "anthropic":
+    url     = "https://api.anthropic.com/v1/messages"
+    payload = {"model": model, "max_tokens": 8192,
+               "messages": [{"role":"user","content":content}]}
+    headers = {"Content-Type": "application/json",
+               "x-api-key": os.environ["ANTHROPIC_API_KEY"],
+               "anthropic-version": "2023-06-01"}
+    extract = lambda d: d["content"][0]["text"]
+elif provider == "openai":
+    url     = "https://api.openai.com/v1/chat/completions"
+    payload = {"model": model, "messages": [{"role":"user","content":content}]}
+    headers = {"Content-Type": "application/json",
+               "Authorization": "Bearer " + os.environ["OPENAI_API_KEY"]}
+    extract = lambda d: d["choices"][0]["message"]["content"]
+else:
+    print("Unknown provider: " + provider, file=sys.stderr)
+    sys.exit(1)
+
+try:
+    req  = urllib.request.Request(url, data=json.dumps(payload).encode(), headers=headers)
+    resp = urllib.request.urlopen(req, timeout=600)
+    data = json.loads(resp.read())
+    print(extract(data))
+except urllib.error.HTTPError as e:
+    body = e.read().decode("utf-8", errors="replace")
+    print("LLM API error ({}): {}".format(e.code, body), file=sys.stderr)
+    sys.exit(1)
+except Exception as e:
+    print("LLM error: {}".format(e), file=sys.stderr)
+    sys.exit(1)
+PYEOF
+}
+
+# ── Core functions ────────────────────────────────────────────────────────────
+
+check_deps() {
+  local missing=()
+  for cmd in yt-dlp ffmpeg python3; do
+    command -v "$cmd" &>/dev/null || missing+=("$cmd")
+  done
+  if [[ ${#missing[@]} -gt 0 ]]; then
+    err "Missing required tools: ${missing[*]}"
+    exit 1
+  fi
+  if [[ "$METHOD" == "whisper" ]] && ! command -v mlx_whisper &>/dev/null; then
+    err "mlx_whisper not installed (needed for --method whisper)"
+    err "Install with:  pipx install mlx-whisper"
+    exit 1
+  fi
+  if [[ "$LLM_PROVIDER" == "llm" ]] && ! command -v llm &>/dev/null; then
+    err "llm CLI not installed (needed for --llm-provider llm)"
+    err "Install with:  pipx install llm"
+    exit 1
+  fi
+  if [[ "$LLM_PROVIDER" == "anthropic" && -z "${ANTHROPIC_API_KEY:-}" ]]; then
+    err "ANTHROPIC_API_KEY not set (needed for --llm-provider anthropic)"
+    exit 1
+  fi
+  if [[ "$LLM_PROVIDER" == "openai" && -z "${OPENAI_API_KEY:-}" ]]; then
+    err "OPENAI_API_KEY not set (needed for --llm-provider openai)"
+    exit 1
+  fi
+}
+
+whisper_transcribe() {
+  local video="$1" scratch="$2" output="$3"
+
+  if ! command -v mlx_whisper &>/dev/null; then
+    err "mlx_whisper not installed.  Install with:  pipx install mlx-whisper"
+    exit 1
+  fi
+
+  local audio="$scratch/audio.m4a"
+
+  log "Extracting audio..."
+  if ! ffmpeg -y -i "$video" -vn -acodec copy "$audio" 2>/dev/null; then
+    err "Failed to extract audio"
+    exit 1
+  fi
+
+  log "Transcribing with Whisper ($WHISPER_MODEL) — this may take a while..."
+  mlx_whisper --model "$WHISPER_MODEL" --output-format txt \
+    --output-dir "$scratch" "$audio"
+
+  mv "$scratch/audio.txt" "$output"
+}
+
+generate_summary() {
+  local transcript="$1" output="$2" title="$3" scratch="$4"
+
+  log "Generating summary ($LLM_PROVIDER / $LLM_MODEL)..."
+
+  local prompt_file="$scratch/llm_prompt.txt"
+
+  # Build prompt: instruction header + full transcript
+  printf 'Summarize the following video transcript titled "%s".\n\n' "$title" > "$prompt_file"
+  cat >> "$prompt_file" << 'INSTRUCTIONS'
+Create a comprehensive markdown summary:
+1. Start with a level-1 heading using the video title
+2. Write a brief 1-2 sentence description
+3. Add a "## Key Topics" section with "###" subsections for each major topic discussed
+4. In each subsection, describe key points and include notable direct quotes in *italics*
+5. End with a brief "## Tone" section
+
+Be thorough but concise.  Start directly with the markdown heading — no preamble.
+
+TRANSCRIPT:
+INSTRUCTIONS
+  cat "$transcript" >> "$prompt_file"
+
+  # Route to the right backend
+  if [[ "$LLM_PROVIDER" == "llm" ]]; then
+    local llm_args=()
+    [[ -n "$LLM_MODEL" ]] && llm_args+=(-m "$LLM_MODEL")
+    llm "${llm_args[@]}" < "$prompt_file" > "$output"
+  else
+    call_llm_api "$prompt_file" "$LLM_PROVIDER" "$LLM_MODEL" > "$output"
+  fi
+
+  if [[ ! -s "$output" ]]; then
+    err "LLM returned empty output"
+    exit 1
+  fi
+}
+
+# ── Parse arguments ───────────────────────────────────────────────────────────
+
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    -u|--url)            URL="$2";            shift 2 ;;
+    -m|--method)         METHOD="$2";         shift 2 ;;
+    -w|--whisper-model)  WHISPER_MODEL="$2";  shift 2 ;;
+    -o|--output-dir)     OUTPUT_DIR="$2";     shift 2 ;;
+    -p|--llm-provider)   LLM_PROVIDER="$2";  shift 2 ;;
+    -l|--llm-model)      LLM_MODEL="$2";     shift 2 ;;
+    -k|--keep-scratch)   KEEP_SCRATCH=true;   shift ;;
+    -h|--help)           usage; exit 0 ;;
+    -v|--version)        echo "get-yt $VERSION"; exit 0 ;;
+    -*)                  err "Unknown option: $1"; echo; usage; exit 1 ;;
+    *)                   URL="$1"; shift ;;
+  esac
+done
+
+# ── Prompt for URL if not supplied ────────────────────────────────────────────
+
+if [[ -z "$URL" ]]; then
+  printf "Enter YouTube URL: "
+  read -r URL
+  if [[ -z "$URL" ]]; then
+    err "No URL provided"
+    exit 1
+  fi
+fi
+
+# ── Validate options ──────────────────────────────────────────────────────────
+
+case "$METHOD" in
+  auto|youtube|whisper) ;;
+  *) err "Invalid --method: $METHOD  (use: auto, youtube, whisper)"; exit 1 ;;
+esac
+
+# Auto-detect LLM provider if not specified
+if [[ -z "$LLM_PROVIDER" ]]; then
+  LLM_PROVIDER=$(detect_llm_provider)
+  if [[ -z "$LLM_PROVIDER" ]]; then
+    err "No LLM provider found. Install ollama, the llm CLI, or set ANTHROPIC_API_KEY / OPENAI_API_KEY."
+    exit 1
+  fi
+fi
+
+case "$LLM_PROVIDER" in
+  ollama|llm|anthropic|openai) ;;
+  *) err "Invalid --llm-provider: $LLM_PROVIDER  (use: ollama, llm, anthropic, openai)"; exit 1 ;;
+esac
+
+# Auto-detect model if not specified
+if [[ -z "$LLM_MODEL" ]]; then
+  LLM_MODEL=$(default_llm_model "$LLM_PROVIDER")
+  if [[ -z "$LLM_MODEL" && "$LLM_PROVIDER" != "llm" ]]; then
+    err "Could not detect a default model for $LLM_PROVIDER. Specify one with --llm-model."
+    exit 1
+  fi
+fi
+
+check_deps
+
+# ── Fetch video metadata ─────────────────────────────────────────────────────
+
+log "Fetching video metadata..."
+{
+  read -r VIDEO_ID
+  read -r VIDEO_TITLE
+} < <(yt-dlp --print "%(id)s" --print "%(title)s" --no-playlist "$URL" 2>/dev/null)
+
+if [[ -z "${VIDEO_ID:-}" || -z "${VIDEO_TITLE:-}" ]]; then
+  err "Could not retrieve video metadata — check the URL"
+  exit 1
+fi
+
+log "Video: $VIDEO_TITLE [$VIDEO_ID]"
+
+# ── Create directory structure ────────────────────────────────────────────────
+
+SAFE_TITLE=$(sanitize "$VIDEO_TITLE")
+VIDEO_DIR="$OUTPUT_DIR/${SAFE_TITLE}_${VIDEO_ID}"
+SCRATCH_DIR="$OUTPUT_DIR/.scratch/$VIDEO_ID"
+mkdir -p "$VIDEO_DIR" "$SCRATCH_DIR"
+
+# ── Short-circuit if everything already exists ────────────────────────────────
+
+if [[ -f "$VIDEO_DIR/video.mp4" && -f "$VIDEO_DIR/transcript.txt" && -f "$VIDEO_DIR/summary.md" ]]; then
+  ok "All outputs already exist in $VIDEO_DIR"
+  exit 0
+fi
+
+# ── 1. Download video (+ subtitles when relevant) ────────────────────────────
+
+if [[ -f "$VIDEO_DIR/video.mp4" ]]; then
+  log "Video already downloaded — skipping"
+else
+  log "Downloading video..."
+
+  YTDLP_ARGS=(
+    -S "vcodec:h264,res,acodec:m4a"
+    --merge-output-format mp4
+    --remux-video mp4
+    --no-playlist
+    -o "$SCRATCH_DIR/video.%(ext)s"
+  )
+
+  # Grab subtitles in the same request when we might need them
+  if [[ "$METHOD" != "whisper" ]]; then
+    YTDLP_ARGS+=(--write-subs --write-auto-subs --sub-langs "en.*" --sub-format vtt)
+  fi
+
+  yt-dlp "${YTDLP_ARGS[@]}" "$URL"
+
+  if [[ ! -f "$SCRATCH_DIR/video.mp4" ]]; then
+    err "Video download failed"
+    exit 1
+  fi
+  mv "$SCRATCH_DIR/video.mp4" "$VIDEO_DIR/video.mp4"
+  ok "Video saved"
+fi
+
+# ── 2. Generate transcript ───────────────────────────────────────────────────
+
+if [[ -f "$VIDEO_DIR/transcript.txt" ]]; then
+  log "Transcript already exists — skipping"
+else
+  case "$METHOD" in
+    youtube|auto)
+      # Look for a VTT file downloaded alongside the video
+      VTT_FILE=$(find "$SCRATCH_DIR" -name "*.vtt" 2>/dev/null | head -1)
+
+      # If not found (e.g. video was already cached), try a subtitle-only fetch
+      if [[ -z "$VTT_FILE" ]]; then
+        log "Downloading subtitles..."
+        yt-dlp --write-subs --write-auto-subs --sub-langs "en.*" --sub-format vtt \
+          --skip-download --no-playlist -o "$SCRATCH_DIR/subs" "$URL" 2>/dev/null || true
+        VTT_FILE=$(find "$SCRATCH_DIR" -name "*.vtt" 2>/dev/null | head -1)
+      fi
+
+      if [[ -n "$VTT_FILE" ]]; then
+        log "Cleaning YouTube transcript..."
+        clean_vtt "$VTT_FILE" > "$VIDEO_DIR/transcript.txt"
+        ok "Transcript saved (source: YouTube subtitles)"
+      elif [[ "$METHOD" == "auto" ]]; then
+        warn "No YouTube subtitles — falling back to Whisper"
+        whisper_transcribe "$VIDEO_DIR/video.mp4" "$SCRATCH_DIR" "$VIDEO_DIR/transcript.txt"
+        ok "Transcript saved (source: Whisper)"
+      else
+        err "No YouTube subtitles available for this video"
+        err "Try:  --method whisper  or  --method auto"
+        exit 1
+      fi
+      ;;
+    whisper)
+      whisper_transcribe "$VIDEO_DIR/video.mp4" "$SCRATCH_DIR" "$VIDEO_DIR/transcript.txt"
+      ok "Transcript saved (source: Whisper)"
+      ;;
+  esac
+fi
+
+# ── 3. Generate summary (single LLM request) ─────────────────────────────────
+
+if [[ -f "$VIDEO_DIR/summary.md" ]]; then
+  log "Summary already exists — skipping"
+else
+  generate_summary "$VIDEO_DIR/transcript.txt" "$VIDEO_DIR/summary.md" "$VIDEO_TITLE" "$SCRATCH_DIR"
+  ok "Summary saved"
+fi
+
+# ── 4. Cleanup scratch ───────────────────────────────────────────────────────
+
+if [[ "$KEEP_SCRATCH" == true ]]; then
+  log "Scratch files kept at: $SCRATCH_DIR"
+else
+  rm -rf "$SCRATCH_DIR"
+  rmdir "$OUTPUT_DIR/.scratch" 2>/dev/null || true
+fi
+
+# ── Done ──────────────────────────────────────────────────────────────────────
+
+echo ""
+ok "Complete!  $VIDEO_DIR/"
+echo "   📹  video.mp4"
+echo "   📝  transcript.txt"
+echo "   📋  summary.md"

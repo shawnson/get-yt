@@ -1,0 +1,8 @@
+# Script output directories (created per-video)
+*_*/
+
+# Scratch working directory
+.scratch/
+
+# macOS
+.DS_Store
