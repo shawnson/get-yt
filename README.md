@@ -82,7 +82,7 @@ llm keys set openai          # or install a plugin: llm install llm-claude-3
 ```
 
 ### `anthropic`
-Direct API call via `curl`. Requires `ANTHROPIC_API_KEY` in the environment.
+Direct API call via `python3`. Requires `ANTHROPIC_API_KEY` in the environment.
 
 ```sh
 export ANTHROPIC_API_KEY="sk-ant-..."
@@ -91,7 +91,7 @@ export ANTHROPIC_API_KEY="sk-ant-..."
 ```
 
 ### `openai`
-Direct API call via `curl`. Requires `OPENAI_API_KEY` in the environment.
+Direct API call via `python3`. Requires `OPENAI_API_KEY` in the environment.
 
 ```sh
 export OPENAI_API_KEY="sk-..."

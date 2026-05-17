@@ -361,7 +361,6 @@ log "Video: $VIDEO_TITLE [$VIDEO_ID]"
 SAFE_TITLE=$(sanitize "$VIDEO_TITLE")
 VIDEO_DIR="$OUTPUT_DIR/${SAFE_TITLE}_${VIDEO_ID}"
 SCRATCH_DIR="$OUTPUT_DIR/.scratch/$VIDEO_ID"
-mkdir -p "$VIDEO_DIR" "$SCRATCH_DIR"
 
 # ── Short-circuit if everything already exists ────────────────────────────────
 
@@ -369,6 +368,8 @@ if [[ -f "$VIDEO_DIR/video.mp4" && -f "$VIDEO_DIR/transcript.txt" && -f "$VIDEO_
   ok "All outputs already exist in $VIDEO_DIR"
   exit 0
 fi
+
+mkdir -p "$VIDEO_DIR" "$SCRATCH_DIR"
 
 # ── 1. Download video (+ subtitles when relevant) ────────────────────────────
 
@@ -387,10 +388,10 @@ else
 
   # Grab subtitles in the same request when we might need them
   if [[ "$METHOD" != "whisper" ]]; then
-    YTDLP_ARGS+=(--write-subs --write-auto-subs --sub-langs "en.*" --sub-format vtt)
+    YTDLP_ARGS+=(--write-subs --write-auto-subs --sub-langs "en" --sub-format vtt)
   fi
 
-  yt-dlp "${YTDLP_ARGS[@]}" "$URL"
+  yt-dlp "${YTDLP_ARGS[@]}" "$URL" || true
 
   if [[ ! -f "$SCRATCH_DIR/video.mp4" ]]; then
     err "Video download failed"
@@ -413,7 +414,7 @@ else
       # If not found (e.g. video was already cached), try a subtitle-only fetch
       if [[ -z "$VTT_FILE" ]]; then
         log "Downloading subtitles..."
-        yt-dlp --write-subs --write-auto-subs --sub-langs "en.*" --sub-format vtt \
+        yt-dlp --write-subs --write-auto-subs --sub-langs "en" --sub-format vtt \
           --skip-download --no-playlist -o "$SCRATCH_DIR/subs" "$URL" 2>/dev/null || true
         VTT_FILE=$(find "$SCRATCH_DIR" -name "*.vtt" 2>/dev/null | head -1)
       fi
