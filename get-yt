@@ -17,6 +17,7 @@ KEEP_SCRATCH=false
 AUDIO_ONLY=false
 NO_SUMMARY=false
 TRANSCRIPT_ONLY=false
+DIARIZE=false
 URL=""
 
 # ── Colors ────────────────────────────────────────────────────────────────────
@@ -48,10 +49,11 @@ Options:
   -w, --whisper-model MODEL    Whisper model (default: mlx-community/whisper-large-v3-turbo)
   -o, --output-dir DIR         Base output directory (default: current directory)
   -p, --llm-provider PROVIDER  LLM backend (auto-detected if omitted)
-                                 ollama, llm, anthropic, openai
+                                 lmstudio, ollama, llm, anthropic, openai
   -l, --llm-model MODEL        LLM model name (provider-specific default)
   -a, --audio-only             Download audio only (m4a) — no video
   -t, --transcript-only        Get transcript only — no video/audio download
+  -d, --diarize                Add speaker labels via LLM post-processing
   -n, --no-summary             Skip the LLM summarization step
   -k, --keep-scratch           Keep temporary working files
   -h, --help                   Show this help message
@@ -65,6 +67,7 @@ Dependencies:
 
 Examples:
   get-yt "https://www.youtube.com/watch?v=VckmK-ZCpAU"
+  get-yt --diarize "$URL"
   get-yt --audio-only "$URL"
   get-yt --transcript-only "$URL"
   get-yt --no-summary -o ~/archive "$URL"
@@ -112,8 +115,10 @@ PYEOF
 # ── LLM integration ──────────────────────────────────────────────────────────
 
 detect_llm_provider() {
-  # Prefer ollama (local, no API key needed) → llm CLI → cloud APIs
-  if curl -sf http://localhost:11434/api/tags >/dev/null 2>&1; then
+  # Prefer local servers → llm CLI → cloud APIs
+  if curl -sf http://localhost:1234/v1/models >/dev/null 2>&1; then
+    echo "lmstudio"
+  elif curl -sf http://localhost:11434/api/tags >/dev/null 2>&1; then
     echo "ollama"
   elif command -v llm &>/dev/null; then
     echo "llm"
@@ -128,6 +133,18 @@ detect_llm_provider() {
 
 default_llm_model() {
   case "$1" in
+    lmstudio)
+      # Pick the first loaded model from LM Studio
+      curl -sf http://localhost:1234/v1/models 2>/dev/null | \
+        python3 -c "
+import json, sys
+try:
+    data = json.loads(sys.stdin.read())
+    models = [m['id'] for m in data.get('data', [])]
+    print(models[0] if models else '')
+except: pass
+" 2>/dev/null || echo ""
+      ;;
     ollama)
       # Pick the first installed model
       curl -sf http://localhost:11434/api/tags 2>/dev/null | \
@@ -158,7 +175,12 @@ prompt_file, provider, model = sys.argv[1], sys.argv[2], sys.argv[3]
 with open(prompt_file, encoding="utf-8") as f:
     content = f.read()
 
-if provider == "ollama":
+if provider == "lmstudio":
+    url     = "http://localhost:1234/v1/chat/completions"
+    payload = {"model": model, "messages": [{"role":"user","content":content}]}
+    headers = {"Content-Type": "application/json"}
+    extract = lambda d: d["choices"][0]["message"]["content"]
+elif provider == "ollama":
     url     = "http://localhost:11434/api/chat"
     payload = {"model": model, "messages": [{"role":"user","content":content}], "stream": False}
     headers = {"Content-Type": "application/json"}
@@ -300,6 +322,7 @@ while [[ $# -gt 0 ]]; do
     -l|--llm-model)      LLM_MODEL="$2";     shift 2 ;;
     -a|--audio-only)     AUDIO_ONLY=true;     shift ;;
     -t|--transcript-only) TRANSCRIPT_ONLY=true; shift ;;
+    -d|--diarize)        DIARIZE=true;         shift ;;
     -n|--no-summary)     NO_SUMMARY=true;      shift ;;
     -k|--keep-scratch)   KEEP_SCRATCH=true;    shift ;;
     -h|--help)           usage; exit 0 ;;
@@ -327,8 +350,16 @@ case "$METHOD" in
   *) err "Invalid --method: $METHOD  (use: auto, youtube, whisper)"; exit 1 ;;
 esac
 
-# Skip LLM setup entirely when summary is not needed
+# LLM is needed for summary or diarization
+NEEDS_LLM=false
+if [[ "$DIARIZE" == true ]]; then
+  NEEDS_LLM=true
+fi
 if [[ "$NO_SUMMARY" == false && "$TRANSCRIPT_ONLY" == false ]]; then
+  NEEDS_LLM=true
+fi
+
+if [[ "$NEEDS_LLM" == true ]]; then
   # Auto-detect LLM provider if not specified
   if [[ -z "$LLM_PROVIDER" ]]; then
     LLM_PROVIDER=$(detect_llm_provider)
@@ -339,8 +370,8 @@ if [[ "$NO_SUMMARY" == false && "$TRANSCRIPT_ONLY" == false ]]; then
   fi
 
   case "$LLM_PROVIDER" in
-    ollama|llm|anthropic|openai) ;;
-    *) err "Invalid --llm-provider: $LLM_PROVIDER  (use: ollama, llm, anthropic, openai)"; exit 1 ;;
+    lmstudio|ollama|llm|anthropic|openai) ;;
+    *) err "Invalid --llm-provider: $LLM_PROVIDER  (use: lmstudio, ollama, llm, anthropic, openai)"; exit 1 ;;
   esac
 
   # Auto-detect model if not specified
@@ -390,18 +421,25 @@ fi
 
 SKIP_SUMMARY=$([[ "$NO_SUMMARY" == true || "$TRANSCRIPT_ONLY" == true ]] && echo true || echo false)
 
+# Determine the "best" transcript path (diarized if available)
+if [[ "$DIARIZE" == true ]]; then
+  BEST_TRANSCRIPT="$VIDEO_DIR/transcript.diarized.txt"
+else
+  BEST_TRANSCRIPT="$VIDEO_DIR/transcript.txt"
+fi
+
 if [[ "$TRANSCRIPT_ONLY" == true ]]; then
-  if [[ -f "$VIDEO_DIR/transcript.txt" ]]; then
+  if [[ -f "$BEST_TRANSCRIPT" ]]; then
     ok "Transcript already exists in $VIDEO_DIR"
     exit 0
   fi
 elif [[ "$SKIP_SUMMARY" == true ]]; then
-  if [[ -n "$MEDIA_FILE" && -f "$VIDEO_DIR/$MEDIA_FILE" && -f "$VIDEO_DIR/transcript.txt" ]]; then
+  if [[ -n "$MEDIA_FILE" && -f "$VIDEO_DIR/$MEDIA_FILE" && -f "$BEST_TRANSCRIPT" ]]; then
     ok "All outputs already exist in $VIDEO_DIR"
     exit 0
   fi
 else
-  if [[ -n "$MEDIA_FILE" && -f "$VIDEO_DIR/$MEDIA_FILE" && -f "$VIDEO_DIR/transcript.txt" && -f "$VIDEO_DIR/summary.md" ]]; then
+  if [[ -n "$MEDIA_FILE" && -f "$VIDEO_DIR/$MEDIA_FILE" && -f "$BEST_TRANSCRIPT" && -f "$VIDEO_DIR/summary.md" ]]; then
     ok "All outputs already exist in $VIDEO_DIR"
     exit 0
   fi
@@ -522,6 +560,59 @@ else
   esac
 fi
 
+# ── 2.5. Diarize transcript (LLM speaker attribution) ────────────────────────
+
+if [[ "$DIARIZE" == true ]]; then
+  if [[ -f "$VIDEO_DIR/transcript.diarized.txt" ]]; then
+    log "Diarized transcript already exists — skipping"
+  else
+    log "Adding speaker labels ($LLM_PROVIDER / $LLM_MODEL)..."
+
+    local_prompt="$SCRATCH_DIR/diarize_prompt.txt"
+
+    cat > "$local_prompt" << DIARIZE_INSTRUCTIONS
+You are a transcript labeler. Your ONLY job is to prepend a speaker name to each line.
+
+Video title: "$VIDEO_TITLE"
+
+INSTRUCTIONS:
+1. Prepend "SPEAKER NAME:" to every line of the transcript below.
+2. Infer speaker names from the video title and dialogue context.
+3. Use short, consistent names in ALL CAPS (e.g. DICK CAVETT, BETTE DAVIS, ANNOUNCER, AUDIENCE MEMBER).
+4. Preserve every line exactly as written. Do NOT rewrite, summarize, analyze, or omit anything.
+5. Output ONLY the labeled lines. No headers, no commentary, no analysis.
+
+Example input:
+Hello everyone, welcome to the show.
+Thank you, it's great to be here.
+So tell me about your new movie.
+
+Example output:
+HOST: Hello everyone, welcome to the show.
+GUEST: Thank you, it's great to be here.
+HOST: So tell me about your new movie.
+
+Now label this transcript:
+DIARIZE_INSTRUCTIONS
+    cat "$VIDEO_DIR/transcript.txt" >> "$local_prompt"
+
+    if [[ "$LLM_PROVIDER" == "llm" ]]; then
+      local llm_args=()
+      [[ -n "$LLM_MODEL" ]] && llm_args+=(-m "$LLM_MODEL")
+      llm "${llm_args[@]}" < "$local_prompt" > "$VIDEO_DIR/transcript.diarized.txt"
+    else
+      call_llm_api "$local_prompt" "$LLM_PROVIDER" "$LLM_MODEL" > "$VIDEO_DIR/transcript.diarized.txt"
+    fi
+
+    if [[ ! -s "$VIDEO_DIR/transcript.diarized.txt" ]]; then
+      err "Diarization LLM returned empty output"
+      rm -f "$VIDEO_DIR/transcript.diarized.txt"
+      exit 1
+    fi
+    ok "Diarized transcript saved"
+  fi
+fi
+
 # ── 3. Generate summary (single LLM request) ─────────────────────────────────
 
 if [[ "$SKIP_SUMMARY" == true ]]; then
@@ -529,7 +620,7 @@ if [[ "$SKIP_SUMMARY" == true ]]; then
 elif [[ -f "$VIDEO_DIR/summary.md" ]]; then
   log "Summary already exists — skipping"
 else
-  generate_summary "$VIDEO_DIR/transcript.txt" "$VIDEO_DIR/summary.md" "$VIDEO_TITLE" "$SCRATCH_DIR"
+  generate_summary "$BEST_TRANSCRIPT" "$VIDEO_DIR/summary.md" "$VIDEO_TITLE" "$SCRATCH_DIR"
   ok "Summary saved"
 fi
 
@@ -554,6 +645,9 @@ if [[ -n "$MEDIA_FILE" ]]; then
   fi
 fi
 echo "   📝  transcript.txt"
+if [[ "$DIARIZE" == true ]]; then
+  echo "   🗣️  transcript.diarized.txt"
+fi
 if [[ "$SKIP_SUMMARY" == false ]]; then
   echo "   📋  summary.md"
 fi

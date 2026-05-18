@@ -43,6 +43,7 @@ One-command tool to download a YouTube video, generate a transcript, and produce
 | `-l, --llm-model MODEL` | Model name for the chosen provider | provider-specific |
 | `-a, --audio-only` | Download audio only (m4a) — no video | off |
 | `-t, --transcript-only` | Get transcript only — no media download | off |
+| `-d, --diarize` | Add speaker labels via LLM post-processing | off |
 | `-n, --no-summary` | Skip the LLM summarization step | off |
 | `-k, --keep-scratch` | Preserve the `.scratch/` working directory | off |
 | `-h, --help` | Print usage and exit | — |
@@ -127,6 +128,13 @@ The script checks for existing output files at each step and skips work that's a
 
 ## Selective Output Modes
 
+### `--diarize` (`-d`)
+Adds speaker labels to the transcript using an LLM post-processing pass. The raw transcript is kept as `transcript.txt` and the labeled version is saved as `transcript.diarized.txt`. The summary (if generated) uses the diarized version for better context.
+
+The LLM infers speaker names from the video title and dialogue context (e.g. "DICK CAVETT:", "BETTE DAVIS:"). Works with any LLM provider. Can be combined with `--no-summary` to get just the labeled transcript.
+
+**Note:** Diarization quality depends heavily on model capability and context window size. Small local models may struggle with long transcripts. For best results, use a large-context model (Claude, GPT-4o, or a larger ollama model like `llama3:70b`).
+
 ### `--audio-only` (`-a`)
 Downloads only the audio track as `audio.m4a` instead of the full video. Useful for podcasts, interviews, or saving disk space. The transcript and summary steps work the same — Whisper can transcribe directly from the audio file.
 
@@ -141,6 +149,9 @@ Skips the LLM summarization step. Produces the media file and transcript but no 
 ```sh
 # Basic — auto-detect everything
 ./get-yt "https://www.youtube.com/watch?v=VckmK-ZCpAU"
+
+# Add speaker labels to transcript
+./get-yt --diarize "$URL"
 
 # Audio only — no video file
 ./get-yt --audio-only "$URL"
