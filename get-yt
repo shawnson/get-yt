@@ -49,7 +49,7 @@ Options:
   -w, --whisper-model MODEL    Whisper model (default: mlx-community/whisper-large-v3-turbo)
   -o, --output-dir DIR         Base output directory (default: current directory)
   -p, --llm-provider PROVIDER  LLM backend (auto-detected if omitted)
-                                 ollama, llm, anthropic, openai
+                                 lmstudio, ollama, llm, anthropic, openai
   -l, --llm-model MODEL        LLM model name (provider-specific default)
   -a, --audio-only             Download audio only (m4a) — no video
   -t, --transcript-only        Get transcript only — no video/audio download
@@ -115,8 +115,10 @@ PYEOF
 # ── LLM integration ──────────────────────────────────────────────────────────
 
 detect_llm_provider() {
-  # Prefer ollama (local, no API key needed) → llm CLI → cloud APIs
-  if curl -sf http://localhost:11434/api/tags >/dev/null 2>&1; then
+  # Prefer local servers → llm CLI → cloud APIs
+  if curl -sf http://localhost:1234/v1/models >/dev/null 2>&1; then
+    echo "lmstudio"
+  elif curl -sf http://localhost:11434/api/tags >/dev/null 2>&1; then
     echo "ollama"
   elif command -v llm &>/dev/null; then
     echo "llm"
@@ -131,6 +133,18 @@ detect_llm_provider() {
 
 default_llm_model() {
   case "$1" in
+    lmstudio)
+      # Pick the first loaded model from LM Studio
+      curl -sf http://localhost:1234/v1/models 2>/dev/null | \
+        python3 -c "
+import json, sys
+try:
+    data = json.loads(sys.stdin.read())
+    models = [m['id'] for m in data.get('data', [])]
+    print(models[0] if models else '')
+except: pass
+" 2>/dev/null || echo ""
+      ;;
     ollama)
       # Pick the first installed model
       curl -sf http://localhost:11434/api/tags 2>/dev/null | \
@@ -161,7 +175,12 @@ prompt_file, provider, model = sys.argv[1], sys.argv[2], sys.argv[3]
 with open(prompt_file, encoding="utf-8") as f:
     content = f.read()
 
-if provider == "ollama":
+if provider == "lmstudio":
+    url     = "http://localhost:1234/v1/chat/completions"
+    payload = {"model": model, "messages": [{"role":"user","content":content}]}
+    headers = {"Content-Type": "application/json"}
+    extract = lambda d: d["choices"][0]["message"]["content"]
+elif provider == "ollama":
     url     = "http://localhost:11434/api/chat"
     payload = {"model": model, "messages": [{"role":"user","content":content}], "stream": False}
     headers = {"Content-Type": "application/json"}
@@ -351,8 +370,8 @@ if [[ "$NEEDS_LLM" == true ]]; then
   fi
 
   case "$LLM_PROVIDER" in
-    ollama|llm|anthropic|openai) ;;
-    *) err "Invalid --llm-provider: $LLM_PROVIDER  (use: ollama, llm, anthropic, openai)"; exit 1 ;;
+    lmstudio|ollama|llm|anthropic|openai) ;;
+    *) err "Invalid --llm-provider: $LLM_PROVIDER  (use: lmstudio, ollama, llm, anthropic, openai)"; exit 1 ;;
   esac
 
   # Auto-detect model if not specified
