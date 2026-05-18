@@ -22,10 +22,11 @@ One-command tool to download a YouTube video, generate a transcript, and produce
 
 **At least one LLM backend** (auto-detected in this order):
 
-1. **ollama** — `brew install ollama` (local, no API key needed)
-2. **llm** CLI — `pipx install llm` (Simon Willison's multi-provider CLI)
-3. **Anthropic API** — set `ANTHROPIC_API_KEY` env var
-4. **OpenAI API** — set `OPENAI_API_KEY` env var
+1. **LM Studio** — [lmstudio.ai](https://lmstudio.ai) (local, Apple Silicon optimized, no API key)
+2. **ollama** — `brew install ollama` (local, no API key needed)
+3. **llm** CLI — `pipx install llm` (Simon Willison's multi-provider CLI)
+4. **Anthropic API** — set `ANTHROPIC_API_KEY` env var
+5. **OpenAI API** — set `OPENAI_API_KEY` env var
 
 **Optional (for `--method whisper`):**
 
@@ -39,7 +40,7 @@ One-command tool to download a YouTube video, generate a transcript, and produce
 | `-m, --method METHOD` | Transcript source: `auto`, `youtube`, `whisper` | `auto` |
 | `-w, --whisper-model MODEL` | Whisper model identifier | `mlx-community/whisper-large-v3-turbo` |
 | `-o, --output-dir DIR` | Base directory for all output | `.` (current dir) |
-| `-p, --llm-provider PROVIDER` | LLM backend: `ollama`, `llm`, `anthropic`, `openai` | auto-detected |
+| `-p, --llm-provider PROVIDER` | LLM backend: `lmstudio`, `ollama`, `llm`, `anthropic`, `openai` | auto-detected |
 | `-l, --llm-model MODEL` | Model name for the chosen provider | provider-specific |
 | `-a, --audio-only` | Download audio only (m4a) — no video | off |
 | `-t, --transcript-only` | Get transcript only — no media download | off |
@@ -62,9 +63,25 @@ Extracts audio from the downloaded video and transcribes locally using `mlx_whis
 
 ## LLM Providers (`--llm-provider`)
 
-The script makes exactly **one** LLM request per video — sending the full transcript with a structured summarization prompt.
+The script makes exactly **one** LLM request per video — sending the full transcript with a structured summarization prompt. With `--diarize`, a second request is made for speaker attribution.
 
-### `ollama` (default when running)
+### `lmstudio` (default when running)
+Connects to [LM Studio](https://lmstudio.ai)'s local server at `localhost:1234` via its OpenAI-compatible API. Auto-selects the currently loaded model. No API key required.
+
+LM Studio runs Apple Silicon-optimized models (MLX, GGUF) and is the recommended local provider for macOS. Install from [lmstudio.ai](https://lmstudio.ai), load a model, and enable the local server.
+
+```sh
+# Auto-detected when LM Studio server is running
+./get-yt "$URL"
+
+# Explicitly select LM Studio
+./get-yt -p lmstudio "$URL"
+
+# Use a specific loaded model
+./get-yt -p lmstudio -l "qwen/qwen3-vl-8b" "$URL"
+```
+
+### `ollama`
 Connects to the local Ollama server at `localhost:11434`. Auto-selects the first installed model if `--llm-model` is not set.
 
 ```sh
@@ -179,12 +196,12 @@ done < urls.txt
 - **Context window limits:** Very long videos (3+ hours) may produce transcripts that exceed the context window of smaller models. Use a model with a large context window (e.g., Gemini, Claude, GPT-4o) for long content.
 - **YouTube subtitle quality:** Auto-generated subtitles have no punctuation or speaker labels. Whisper transcripts are generally more readable.
 - **Video format:** Videos are downloaded with h264 video + m4a audio in an mp4 container for broad compatibility.
-- **Single LLM call:** The script sends exactly one LLM request per video to minimize cost and latency.
+- **LLM calls:** The script sends one LLM request per video for summarization. With `--diarize`, a second request is made for speaker attribution.
 
 ## Troubleshooting
 
 **"No LLM provider found"**
-Install ollama (`brew install ollama && ollama serve`), the llm CLI (`pipx install llm`), or set an API key (`export ANTHROPIC_API_KEY=...`).
+Install LM Studio ([lmstudio.ai](https://lmstudio.ai)), ollama (`brew install ollama && ollama serve`), the llm CLI (`pipx install llm`), or set an API key (`export ANTHROPIC_API_KEY=...`).
 
 **"mlx_whisper not installed"**
 Run `pipx install mlx-whisper`. Only needed when using `--method whisper`.
